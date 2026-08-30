@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from mutagen import File as MutagenFile
-from mutagen.flac import FLAC
 
 AUDIO_EXTENSIONS = {".flac", ".mp3", ".ogg", ".m4a", ".wav", ".aac", ".aiff", ".ape"}
+
+# Metadata reads are I/O-bound (network mounts especially), so a bigger
+# pool than the core count still helps. 16 measured best.
+SCAN_WORKERS = 16
 
 
 @dataclass
@@ -53,83 +58,71 @@ def human_length(seconds: float) -> str:
     return f"{minutes}:{remainder:02d}"
 
 
-def _extract_art_dimensions(path: Path) -> str:
-    """Extract embedded album art dimensions for any supported audio format."""
+# Python's default file buffer can balloon to match a large filesystem
+# blksize (NFS mounts often report ~1MB). mutagen seeks around within a
+# file, so a huge buffer means a full re-read on every seek. Keep it small.
+READ_BUFFER_BYTES = 8192
+
+
+def read_audio_details(path: Path) -> tuple[float, str, str]:
+    """Read duration, FLAC block size, and art dimensions in one parse."""
+    duration = 0.0
+    block_size = "-"
+    art_dimensions = "-"
+
+    try:
+        with open(path, "rb", buffering=READ_BUFFER_BYTES) as fh:
+            audio = MutagenFile(fh)
+    except Exception:
+        audio = None
+
+    if audio is None:
+        return duration, block_size, art_dimensions
+
+    info = getattr(audio, "info", None)
+    if info and getattr(info, "length", None):
+        duration = float(info.length)
+
     ext = path.suffix.lower()
+
     try:
         if ext == ".flac":
-            flac = FLAC(path)
-            if flac.pictures:
-                p = flac.pictures[0]
+            max_block = int(getattr(info, "max_blocksize", 0) or 0)
+            if max_block > 0:
+                block_size = str(max_block)
+            if audio.pictures:
+                p = audio.pictures[0]
                 if p.width > 0 and p.height > 0:
-                    return f"{p.width}x{p.height}"
-        elif ext in {".mp3", ".aiff"}:
+                    art_dimensions = f"{p.width}x{p.height}"
+        elif ext in {".mp3", ".aiff"} and audio.tags is not None:
             from io import BytesIO
-            from mutagen.id3 import ID3
             from PIL import Image
-            tags = ID3(path)
-            frames = tags.getall("APIC")
+            frames = audio.tags.getall("APIC")
             if frames and frames[0].data:
                 img = Image.open(BytesIO(frames[0].data))
-                return f"{img.width}x{img.height}"
-        elif ext in {".m4a", ".aac"}:
+                art_dimensions = f"{img.width}x{img.height}"
+        elif ext in {".m4a", ".aac"} and audio.tags is not None:
             from io import BytesIO
-            from mutagen.mp4 import MP4
             from PIL import Image
-            audio = MP4(path)
-            if audio.tags and "covr" in audio.tags and audio.tags["covr"]:
+            if "covr" in audio.tags and audio.tags["covr"]:
                 img = Image.open(BytesIO(bytes(audio.tags["covr"][0])))
-                return f"{img.width}x{img.height}"
+                art_dimensions = f"{img.width}x{img.height}"
         elif ext in {".ogg", ".opus"}:
             import base64
             from io import BytesIO
-            from mutagen.oggvorbis import OggVorbis
             from mutagen.flac import Picture
             from PIL import Image
-            audio = OggVorbis(path)
-            raw_list = audio.get("metadata_block_picture", [])
+            raw_list = audio.get("metadata_block_picture", []) if hasattr(audio, "get") else []
             if raw_list:
                 pad = "=" * (-len(raw_list[0]) % 4)
                 pic = Picture(base64.b64decode(raw_list[0] + pad))
                 if pic.data:
                     img = Image.open(BytesIO(pic.data))
-                    return f"{img.width}x{img.height}"
+                    art_dimensions = f"{img.width}x{img.height}"
     except Exception:
         pass
-    return "-"
-
-
-def read_audio_details(path: Path) -> tuple[float, str, str]:
-    duration = 0.0
-    block_size = "-"
-
-    try:
-        audio = MutagenFile(path)
-        if audio and getattr(audio, "info", None) and getattr(audio.info, "length", None):
-            duration = float(audio.info.length)
-    except Exception:
-        duration = 0.0
-
-    if path.suffix.lower() == ".flac":
-        try:
-            flac = FLAC(path)
-            max_block = int(getattr(flac.info, "max_blocksize", 0) or 0)
-            if max_block > 0:
-                block_size = str(max_block)
-        except Exception:
-            pass
-
-    art_dimensions = _extract_art_dimensions(path)
 
     return duration, block_size, art_dimensions
-
-
-def _count_audio_files(root: Path) -> int:
-    """Fast count of audio files under root — no metadata reads."""
-    try:
-        return sum(1 for p in root.rglob("*") if p.is_file() and is_audio_file(p))
-    except Exception:
-        return 0
 
 
 def scan_source_tree(
@@ -145,8 +138,7 @@ def scan_source_tree(
         children=[],
     )
 
-    total_files = _count_audio_files(source_root)
-    counter = [0]
+    pending_files: list[LibraryNode] = []
 
     def build_dir_node(folder: Path) -> LibraryNode | None:
         folder_children: list[LibraryNode] = []
@@ -174,12 +166,6 @@ def scan_source_tree(
             except OSError:
                 pass
 
-            duration, block_size, art_dimensions = read_audio_details(entry)
-
-            counter[0] += 1
-            if progress_callback and total_files > 0:
-                progress_callback(counter[0], total_files)
-
             rel = entry.relative_to(source_root)
             file_node = LibraryNode(
                 name=entry.name,
@@ -188,11 +174,9 @@ def scan_source_tree(
                 is_dir=False,
                 size_bytes=file_size,
                 format_name=(entry.suffix.lower().lstrip(".") or "-"),
-                duration_seconds=duration,
-                block_size=block_size,
-                art_dimensions=art_dimensions,
             )
             folder_children.append(file_node)
+            pending_files.append(file_node)
             total_size += file_size
 
         if not folder_children and folder != source_root:
@@ -213,6 +197,26 @@ def scan_source_tree(
     if rebuilt:
         root.children = rebuilt.children
         root.size_bytes = rebuilt.size_bytes
+
+    total_files = len(pending_files)
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def process(node: LibraryNode) -> None:
+        nonlocal counter
+        node.duration_seconds, node.block_size, node.art_dimensions = read_audio_details(
+            node.absolute_path
+        )
+        if progress_callback:
+            with counter_lock:
+                counter += 1
+                done = counter
+            progress_callback(done, total_files)
+
+    if pending_files:
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+            list(executor.map(process, pending_files))
+
     return root
 
 
