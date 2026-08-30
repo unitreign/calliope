@@ -12,6 +12,11 @@ data/profiles.json
 data/scan_cache.json
 data/sync_state.json
 
+# Autoresearch: machine-local symlinks into the test library, and result log
+.auto/bench_root/
+.auto/bench_root_dirheavy/
+.auto/log.jsonl
+
 # OS
 .DS_Store
 Thumbs.db

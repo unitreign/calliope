@@ -96,6 +96,9 @@ class MusicTreeWidget(QTreeWidget):
         return mime
 
     def refresh_synced_markers(self, sync_state: dict[str, str], target_root: Path | None) -> None:
+        # Avoid itemChanged re-walking the whole tree's checkbox state per item.
+        self._updating_checks = True
+
         # First pass: mark individual files
         for item in self._iter_items():
             is_dir = bool(item.data(0, ROLE_IS_DIR))
@@ -127,6 +130,8 @@ class MusicTreeWidget(QTreeWidget):
             if self._all_children_synced(item):
                 item.setText(0, f"\u2713 {base_name}")
                 item.setForeground(0, QBrush(QColor("#7dc47d")))
+
+        self._updating_checks = False
 
     def _all_children_synced(self, item: "QTreeWidgetItem") -> bool:
         """True when all file descendants are synced (empty dirs return False)."""
